@@ -1,3 +1,9 @@
+---
+source: tests/cli.rs
+assertion_line: 91
+expression: content
+
+---
 # This is where Foreman stores authentication information for sources.
 
 # For authenticating with GitHub.com, put a personal access token here under the

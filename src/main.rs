@@ -3,17 +3,24 @@ mod artifact_choosing;
 mod auth_store;
 mod ci_string;
 mod config;
+mod error;
 mod fs;
-mod github;
 mod paths;
 mod tool_cache;
+mod tool_provider;
 
-use std::{env, error::Error, io, process};
+use std::{env, ffi::OsStr, process};
 
+use paths::ForemanPaths;
 use structopt::StructOpt;
 
 use crate::{
-    aliaser::add_self_alias, auth_store::AuthStore, config::ConfigFile, tool_cache::ToolCache,
+    aliaser::add_self_alias,
+    auth_store::AuthStore,
+    config::ConfigFile,
+    error::{ForemanError, ForemanResult},
+    tool_cache::ToolCache,
+    tool_provider::ToolProvider,
 };
 
 #[derive(Debug)]
@@ -23,66 +30,101 @@ struct ToolInvocation {
 }
 
 impl ToolInvocation {
-    fn from_env() -> Option<Self> {
-        let app_path = env::current_exe().unwrap();
-        let name = app_path.file_stem()?.to_str()?.to_owned();
+    fn from_env() -> ForemanResult<Option<Self>> {
+        let app_path = env::current_exe().map_err(|err| {
+            ForemanError::io_error_with_context(err, "unable to obtain foreman executable location")
+        })?;
+        let name = if let Some(name) = app_path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .map(ToOwned::to_owned)
+        {
+            name
+        } else {
+            return Ok(None);
+        };
 
         // That's us!
         if name == "foreman" {
-            return None;
+            return Ok(None);
         }
 
         let args = env::args().skip(1).collect();
 
-        Some(Self { name, args })
+        Ok(Some(Self { name, args }))
+    }
+
+    fn run(self, paths: &ForemanPaths) -> ForemanResult<()> {
+        let config = ConfigFile::aggregate(paths)?;
+
+        if let Some(tool_spec) = config.tools.get(&self.name) {
+            log::debug!("Found tool spec {}", tool_spec);
+
+            let mut tool_cache = ToolCache::load(paths)?;
+            let providers = ToolProvider::new(paths);
+            let version = tool_cache.download_if_necessary(tool_spec, &providers)?;
+
+            let exit_code = tool_cache.run(tool_spec, &version, self.args)?;
+
+            if exit_code != 0 {
+                process::exit(exit_code);
+            }
+
+            Ok(())
+        } else {
+            let current_dir = env::current_dir().map_err(|err| {
+                ForemanError::io_error_with_context(
+                    err,
+                    "unable to obtain the current working directory",
+                )
+            })?;
+            Err(ForemanError::ToolNotInstalled {
+                name: self.name,
+                current_path: current_dir,
+                config_file: config,
+            })
+        }
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let env = env_logger::Env::new().default_filter_or("foreman=info");
-    env_logger::Builder::from_env(env)
-        .format_module_path(false)
-        .format_timestamp(None)
-        .format_indent(Some(8))
-        .init();
+fn main() {
+    let paths = ForemanPaths::from_env().unwrap_or_default();
 
-    paths::create()?;
-
-    if let Some(invocation) = ToolInvocation::from_env() {
-        let config = ConfigFile::aggregate()?;
-
-        if let Some(tool_spec) = config.tools.get(&invocation.name) {
-            log::debug!("Found tool spec {}@{}", tool_spec.source, tool_spec.version);
-
-            let maybe_version =
-                ToolCache::download_if_necessary(&tool_spec.source, &tool_spec.version);
-
-            if let Some(version) = maybe_version {
-                let exit_code = ToolCache::run(&tool_spec.source, &version, invocation.args);
-
-                if exit_code != 0 {
-                    process::exit(exit_code);
-                }
-            }
-
-            return Ok(());
-        } else {
-            eprintln!(
-                "'{}' is not a known Foreman tool, but Foreman was invoked with its name.",
-                invocation.name
-            );
-            eprintln!("You may not have this tool installed here, or your install may be broken.");
-
-            return Ok(());
-        }
+    if let Err(error) = paths.create_all() {
+        exit_with_error(error);
     }
 
-    actual_main()?;
-    Ok(())
+    let result = ToolInvocation::from_env().and_then(|maybe_invocation| {
+        if let Some(invocation) = maybe_invocation {
+            let env = env_logger::Env::new().default_filter_or("foreman=info");
+            env_logger::Builder::from_env(env)
+                .format_module_path(false)
+                .format_timestamp(None)
+                .format_indent(Some(8))
+                .init();
+
+            invocation.run(&paths)
+        } else {
+            actual_main(paths)
+        }
+    });
+
+    if let Err(error) = result {
+        exit_with_error(error);
+    }
+}
+
+fn exit_with_error(error: ForemanError) -> ! {
+    eprintln!("{}", error);
+    process::exit(1);
 }
 
 #[derive(Debug, StructOpt)]
 struct Options {
+    /// Logging verbosity. Supply multiple for more verbosity, up to -vvv
+    #[structopt(short, parse(from_occurrences), global = true)]
+    pub verbose: u8,
+
     #[structopt(subcommand)]
     subcommand: Subcommand,
 }
@@ -101,6 +143,13 @@ enum Subcommand {
     /// This token can also be configured by editing ~/.foreman/auth.toml.
     #[structopt(name = "github-auth")]
     GitHubAuth(GitHubAuthCommand),
+
+    /// Set the GitLab Personal Access Token that Foreman should use with the
+    /// GitLab API.
+    ///
+    /// This token can also be configured by editing ~/.foreman/auth.toml.
+    #[structopt(name = "gitlab-auth")]
+    GitLabAuth(GitLabAuthCommand),
 }
 
 #[derive(Debug, StructOpt)]
@@ -111,24 +160,85 @@ struct GitHubAuthCommand {
     token: Option<String>,
 }
 
-fn actual_main() -> io::Result<()> {
+#[derive(Debug, StructOpt)]
+struct GitLabAuthCommand {
+    /// GitLab personal access token that Foreman should use.
+    ///
+    /// If not specified, Foreman will prompt for it.
+    token: Option<String>,
+}
+
+fn actual_main(paths: ForemanPaths) -> ForemanResult<()> {
     let options = Options::from_args();
+
+    {
+        let log_filter = match options.verbose {
+            0 => "warn,foreman=info",
+            1 => "info,foreman=debug",
+            2 => "info,foreman=trace",
+            _ => "trace",
+        };
+
+        let env = env_logger::Env::default().default_filter_or(log_filter);
+
+        env_logger::Builder::from_env(env)
+            .format_module_path(false)
+            .format_target(false)
+            .format_timestamp(None)
+            .format_indent(Some(8))
+            .init();
+    }
 
     match options.subcommand {
         Subcommand::Install => {
-            let config = ConfigFile::aggregate()?;
+            let config = ConfigFile::aggregate(&paths)?;
 
             log::trace!("Installing from gathered config: {:#?}", config);
 
-            for (tool_alias, tool_spec) in &config.tools {
-                ToolCache::download_if_necessary(&tool_spec.source, &tool_spec.version);
-                add_self_alias(tool_alias);
+            let mut cache = ToolCache::load(&paths)?;
+
+            let providers = ToolProvider::new(&paths);
+
+            let tools_not_downloaded: Vec<String> = config
+                .tools
+                .iter()
+                .filter_map(|(tool_alias, tool_spec)| {
+                    cache
+                        .download_if_necessary(tool_spec, &providers)
+                        .and_then(|_| add_self_alias(tool_alias, &paths.bin_dir()))
+                        .err()
+                        .map(|err| {
+                            log::error!(
+                                "The following error occurred while trying to download tool \"{}\":\n{}",
+                                tool_alias,
+                                err
+                            );
+                            tool_alias.to_string()
+                        })
+                })
+                .collect();
+
+            if !tools_not_downloaded.is_empty() {
+                return Err(ForemanError::ToolsNotDownloaded {
+                    tools: tools_not_downloaded,
+                });
+            }
+
+            if config.tools.is_empty() {
+                log::info!(
+                    concat!(
+                        "foreman did not find any tools to install.\n\n",
+                        "You can define system-wide tools in:\n  {}\n",
+                        "or create a 'foreman.toml' file in your project directory.",
+                    ),
+                    paths.user_config().display()
+                );
             }
         }
         Subcommand::List => {
             println!("Installed tools:");
 
-            let cache = ToolCache::load().unwrap();
+            let cache = ToolCache::load(&paths)?;
 
             for (tool_source, tool) in &cache.tools {
                 println!("  {}", tool_source);
@@ -139,30 +249,63 @@ fn actual_main() -> io::Result<()> {
             }
         }
         Subcommand::GitHubAuth(subcommand) => {
-            let token = match subcommand.token {
-                Some(token) => token,
-                None => {
-                    println!("Foreman authenticates to GitHub using Personal Access Tokens.");
-                    println!("https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line");
-                    println!();
+            let token = prompt_auth_token(
+                    subcommand.token,
+                    "GitHub",
+                    "https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line",
+                )?;
 
-                    loop {
-                        let token = rpassword::read_password_from_tty(Some("GitHub Token: "))?;
-
-                        if token.is_empty() {
-                            println!("Token must be non-empty.");
-                        } else {
-                            break token;
-                        }
-                    }
-                }
-            };
-
-            AuthStore::set_github_token(&token)?;
+            AuthStore::set_github_token(&paths.auth_store(), &token)?;
 
             println!("GitHub auth saved successfully.");
+        }
+        Subcommand::GitLabAuth(subcommand) => {
+            let token = prompt_auth_token(
+                subcommand.token,
+                "GitLab",
+                "https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html",
+            )?;
+
+            AuthStore::set_gitlab_token(&paths.auth_store(), &token)?;
+
+            println!("GitLab auth saved successfully.");
         }
     }
 
     Ok(())
+}
+
+fn prompt_auth_token(
+    token: Option<String>,
+    provider: &str,
+    help: &str,
+) -> Result<String, ForemanError> {
+    match token {
+        Some(token) => Ok(token),
+        None => {
+            println!("{} auth saved successfully.", provider);
+            println!(
+                "Foreman authenticates to {} using Personal Access Tokens.",
+                provider
+            );
+            println!("{}", help);
+            println!();
+
+            loop {
+                let token =
+                    rpassword::prompt_password(format!("{} Token: ", provider)).map_err(|err| {
+                        ForemanError::io_error_with_context(
+                            err,
+                            "an error happened trying to read password",
+                        )
+                    })?;
+
+                if token.is_empty() {
+                    println!("Token must be non-empty.");
+                } else {
+                    break Ok(token);
+                }
+            }
+        }
+    }
 }

@@ -1,0 +1,24 @@
+---
+source: tests/cli.rs
+assertion_line: 101
+expression: content
+
+---
+unable to parse Foreman configuration file (at {{CWD}}foreman.toml): data did not match any variant of untagged enum ToolSpec for key `tools.tool` at line 2 column 1
+
+A Foreman configuration file looks like this:
+
+[tools] # list the tools you want to install under this header
+
+# each tool is on its own line, the tool name is on the left
+# side of `=` and the right side tells Foreman where to find
+# it and which version to download
+tool_name = { github = "user/repository-name", version = "1.0.0" }
+
+# tools hosted on gitlab follows the same structure, except
+# `github` is replaced with `gitlab`
+
+# Examples:
+stylua = { github = "JohnnyMorganz/StyLua", version = "0.11.3" }
+darklua = { gitlab = "seaofvoices/darklua", version = "0.7.0" }
+

@@ -1,9 +1,12 @@
-use std::io;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use toml_edit::{value, Document};
+use toml_edit::{value, Document, TomlError};
 
-use crate::{fs, paths};
+use crate::{
+    error::{ForemanError, ForemanResult},
+    fs,
+};
 
 pub static DEFAULT_AUTH_CONFIG: &str = include_str!("../resources/default-auth.toml");
 
@@ -11,50 +14,54 @@ pub static DEFAULT_AUTH_CONFIG: &str = include_str!("../resources/default-auth.t
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AuthStore {
     pub github: Option<String>,
+    pub gitlab: Option<String>,
 }
 
 impl AuthStore {
-    pub fn load() -> io::Result<Self> {
-        log::debug!("Loading auth store...");
+    pub fn load(path: &Path) -> ForemanResult<Self> {
+        if let Some(contents) = fs::try_read(path)? {
+            log::debug!("Loading auth store");
+            let store: AuthStore = toml::from_slice(&contents)
+                .map_err(|error| ForemanError::auth_parsing(path, error.to_string()))?;
 
-        match fs::read(paths::auth_store()) {
-            Ok(contents) => {
-                let store: AuthStore = toml::from_slice(&contents).unwrap();
-
-                if store.github.is_some() {
-                    log::debug!("Found GitHub credentials");
-                } else {
-                    log::debug!("Found no credentials");
-                }
-
-                Ok(store)
+            let mut found_credentials = false;
+            if store.github.is_some() {
+                log::debug!("Found GitHub credentials");
+                found_credentials = true;
             }
-            Err(err) => {
-                if err.kind() == io::ErrorKind::NotFound {
-                    return Ok(AuthStore::default());
-                } else {
-                    return Err(err);
-                }
+            if store.gitlab.is_some() {
+                log::debug!("Found GitLab credentials");
+                found_credentials = true;
             }
+            if !found_credentials {
+                log::debug!("Found no credentials");
+            }
+
+            Ok(store)
+        } else {
+            log::debug!("Auth store not found");
+            Ok(AuthStore::default())
         }
     }
 
-    pub fn set_github_token(token: &str) -> io::Result<()> {
-        let contents = match fs::read_to_string(paths::auth_store()) {
-            Ok(contents) => contents,
-            Err(err) => {
-                if err.kind() == io::ErrorKind::NotFound {
-                    DEFAULT_AUTH_CONFIG.to_owned()
-                } else {
-                    return Err(err);
-                }
-            }
-        };
+    pub fn set_github_token(auth_file: &Path, token: &str) -> ForemanResult<()> {
+        Self::set_token(auth_file, "github", token)
+    }
 
-        let mut store: Document = contents.parse().unwrap();
-        store["github"] = value(token);
+    pub fn set_gitlab_token(auth_file: &Path, token: &str) -> ForemanResult<()> {
+        Self::set_token(auth_file, "gitlab", token)
+    }
+
+    fn set_token(auth_file: &Path, key: &str, token: &str) -> ForemanResult<()> {
+        let contents =
+            fs::try_read_to_string(auth_file)?.unwrap_or_else(|| DEFAULT_AUTH_CONFIG.to_owned());
+
+        let mut store: Document = contents
+            .parse()
+            .map_err(|err: TomlError| ForemanError::auth_parsing(auth_file, err.to_string()))?;
+        store[key] = value(token);
 
         let serialized = store.to_string();
-        fs::write(paths::auth_store(), serialized)
+        fs::write(auth_file, serialized)
     }
 }
